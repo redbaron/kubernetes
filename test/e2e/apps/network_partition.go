@@ -33,7 +33,7 @@ import (
 	"k8s.io/api/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	nodepkg "k8s.io/kubernetes/pkg/controller/node"
+	nodepkg "k8s.io/kubernetes/pkg/controller/nodelifecycle"
 	"k8s.io/kubernetes/test/e2e/common"
 	"k8s.io/kubernetes/test/e2e/framework"
 	testutils "k8s.io/kubernetes/test/utils"
@@ -104,29 +104,26 @@ func newPodOnNode(c clientset.Interface, namespace, podName, nodeName string) er
 
 var _ = SIGDescribe("Network Partition [Disruptive] [Slow]", func() {
 	f := framework.NewDefaultFramework("network-partition")
-	var systemPodsNo int32
 	var c clientset.Interface
 	var ns string
 	ignoreLabels := framework.ImagePullerLabels
-	var group string
 
 	BeforeEach(func() {
 		c = f.ClientSet
 		ns = f.Namespace.Name
-		systemPods, err := framework.GetPodsInNamespace(c, ns, ignoreLabels)
+		_, err := framework.GetPodsInNamespace(c, ns, ignoreLabels)
 		Expect(err).NotTo(HaveOccurred())
-		systemPodsNo = int32(len(systemPods))
+
+		// TODO(foxish): Re-enable testing on gce after kubernetes#56787 is fixed.
+		framework.SkipUnlessProviderIs("gke", "aws")
 		if strings.Index(framework.TestContext.CloudConfig.NodeInstanceGroup, ",") >= 0 {
 			framework.Failf("Test dose not support cluster setup with more than one MIG: %s", framework.TestContext.CloudConfig.NodeInstanceGroup)
-		} else {
-			group = framework.TestContext.CloudConfig.NodeInstanceGroup
 		}
 	})
 
 	framework.KubeDescribe("Pods", func() {
 		Context("should return to running and ready state after network partition is healed", func() {
 			BeforeEach(func() {
-				framework.SkipUnlessProviderIs("gce", "gke", "aws")
 				framework.SkipUnlessNodeCountIsAtLeast(2)
 			})
 
@@ -236,9 +233,11 @@ var _ = SIGDescribe("Network Partition [Disruptive] [Slow]", func() {
 			// The source for the Docker container kubernetes/serve_hostname is in contrib/for-demos/serve_hostname
 			name := "my-hostname-net"
 			common.NewSVCByName(c, ns, name)
-			replicas := int32(framework.TestContext.CloudConfig.NumNodes)
+			numNodes, err := framework.NumberOfRegisteredNodes(f.ClientSet)
+			framework.ExpectNoError(err)
+			replicas := int32(numNodes)
 			common.NewRCByName(c, ns, name, replicas, nil)
-			err := framework.VerifyPods(c, ns, name, true, replicas)
+			err = framework.VerifyPods(c, ns, name, true, replicas)
 			Expect(err).NotTo(HaveOccurred(), "Each pod should start running and responding")
 
 			By("choose a node with at least one pod - we will block some network traffic on this node")
@@ -301,9 +300,11 @@ var _ = SIGDescribe("Network Partition [Disruptive] [Slow]", func() {
 			gracePeriod := int64(30)
 
 			common.NewSVCByName(c, ns, name)
-			replicas := int32(framework.TestContext.CloudConfig.NumNodes)
+			numNodes, err := framework.NumberOfRegisteredNodes(f.ClientSet)
+			framework.ExpectNoError(err)
+			replicas := int32(numNodes)
 			common.NewRCByName(c, ns, name, replicas, &gracePeriod)
-			err := framework.VerifyPods(c, ns, name, true, replicas)
+			err = framework.VerifyPods(c, ns, name, true, replicas)
 			Expect(err).NotTo(HaveOccurred(), "Each pod should start running and responding")
 
 			By("choose a node with at least one pod - we will block some network traffic on this node")
@@ -347,7 +348,8 @@ var _ = SIGDescribe("Network Partition [Disruptive] [Slow]", func() {
 		headlessSvcName := "test"
 
 		BeforeEach(func() {
-			framework.SkipUnlessProviderIs("gce", "gke")
+			// TODO(foxish): Re-enable testing on gce after kubernetes#56787 is fixed.
+			framework.SkipUnlessProviderIs("gke")
 			By("creating service " + headlessSvcName + " in namespace " + f.Namespace.Name)
 			headlessService := framework.CreateServiceSpec(headlessSvcName, "", true, labels)
 			_, err := f.ClientSet.CoreV1().Services(f.Namespace.Name).Create(headlessService)
@@ -368,15 +370,16 @@ var _ = SIGDescribe("Network Partition [Disruptive] [Slow]", func() {
 			petMounts := []v1.VolumeMount{{Name: "datadir", MountPath: "/data/"}}
 			podMounts := []v1.VolumeMount{{Name: "home", MountPath: "/home"}}
 			ps := framework.NewStatefulSet(psName, ns, headlessSvcName, 3, petMounts, podMounts, labels)
-			_, err := c.AppsV1beta1().StatefulSets(ns).Create(ps)
+			_, err := c.AppsV1().StatefulSets(ns).Create(ps)
 			Expect(err).NotTo(HaveOccurred())
 
 			pst := framework.NewStatefulSetTester(c)
 
-			nn := framework.TestContext.CloudConfig.NumNodes
-			nodeNames, err := framework.CheckNodesReady(f.ClientSet, framework.NodeReadyInitialTimeout, nn)
+			nn, err := framework.NumberOfRegisteredNodes(f.ClientSet)
 			framework.ExpectNoError(err)
-			common.RestartNodes(f.ClientSet, nodeNames)
+			nodes, err := framework.CheckNodesReady(f.ClientSet, nn, framework.NodeReadyInitialTimeout)
+			framework.ExpectNoError(err)
+			common.RestartNodes(f.ClientSet, nodes)
 
 			By("waiting for pods to be running again")
 			pst.WaitForRunningAndReady(*ps.Spec.Replicas, ps)
@@ -384,7 +387,7 @@ var _ = SIGDescribe("Network Partition [Disruptive] [Slow]", func() {
 
 		It("should not reschedule stateful pods if there is a network partition [Slow] [Disruptive]", func() {
 			ps := framework.NewStatefulSet(psName, ns, headlessSvcName, 3, []v1.VolumeMount{}, []v1.VolumeMount{}, labels)
-			_, err := c.AppsV1beta1().StatefulSets(ns).Create(ps)
+			_, err := c.AppsV1().StatefulSets(ns).Create(ps)
 			Expect(err).NotTo(HaveOccurred())
 
 			pst := framework.NewStatefulSetTester(c)
@@ -461,7 +464,6 @@ var _ = SIGDescribe("Network Partition [Disruptive] [Slow]", func() {
 	framework.KubeDescribe("Pods", func() {
 		Context("should be evicted from unready Node", func() {
 			BeforeEach(func() {
-				framework.SkipUnlessProviderIs("gce", "gke", "aws")
 				framework.SkipUnlessNodeCountIsAtLeast(2)
 			})
 

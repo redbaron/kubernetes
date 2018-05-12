@@ -23,6 +23,7 @@ import (
 	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/kubernetes/pkg/cloudprovider"
 	"k8s.io/kubernetes/pkg/util/io"
 	"k8s.io/kubernetes/pkg/util/mount"
@@ -38,6 +39,10 @@ func (ctrl *PersistentVolumeController) GetPluginDir(pluginName string) string {
 }
 
 func (ctrl *PersistentVolumeController) GetVolumeDevicePluginDir(pluginName string) string {
+	return ""
+}
+
+func (ctrl *PersistentVolumeController) GetPodsDir() string {
 	return ""
 }
 
@@ -107,4 +112,12 @@ func (adc *PersistentVolumeController) GetExec(pluginName string) mount.Exec {
 
 func (ctrl *PersistentVolumeController) GetNodeLabels() (map[string]string, error) {
 	return nil, fmt.Errorf("GetNodeLabels() unsupported in PersistentVolumeController")
+}
+
+func (ctrl *PersistentVolumeController) GetNodeName() types.NodeName {
+	return ""
+}
+
+func (ctrl *PersistentVolumeController) GetEventRecorder() record.EventRecorder {
+	return ctrl.eventRecorder
 }

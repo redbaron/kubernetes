@@ -17,13 +17,14 @@ limitations under the License.
 package config
 
 import (
-	"bytes"
 	"io/ioutil"
 	"os"
 	"testing"
 
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	"k8s.io/kubernetes/pkg/kubectl/genericclioptions"
 )
 
 type viewClusterTest struct {
@@ -140,9 +141,8 @@ func (test viewClusterTest) run(t *testing.T) {
 	pathOptions := clientcmd.NewDefaultPathOptions()
 	pathOptions.GlobalFile = fakeKubeFile.Name()
 	pathOptions.EnvVar = ""
-	buf := bytes.NewBuffer([]byte{})
-	errBuf := bytes.NewBuffer([]byte{})
-	cmd := NewCmdConfigView(buf, errBuf, pathOptions)
+	streams, _, buf, _ := genericclioptions.NewTestIOStreams()
+	cmd := NewCmdConfigView(cmdutil.NewFactory(cmdutil.NewTestConfigFlags()), streams, pathOptions)
 	cmd.Flags().Parse(test.flags)
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("unexpected error executing command: %v,kubectl config view flags: %v", err, test.flags)

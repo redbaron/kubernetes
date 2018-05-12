@@ -18,10 +18,15 @@ package upgrade
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/errors"
 	clientset "k8s.io/client-go/kubernetes"
+	certutil "k8s.io/client-go/util/cert"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	kubeadmapiext "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1alpha1"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
@@ -31,14 +36,19 @@ import (
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/bootstraptoken/clusterinfo"
 	nodebootstraptoken "k8s.io/kubernetes/cmd/kubeadm/app/phases/bootstraptoken/node"
 	certsphase "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
+	"k8s.io/kubernetes/cmd/kubeadm/app/phases/selfhosting"
 	"k8s.io/kubernetes/cmd/kubeadm/app/phases/uploadconfig"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/apiclient"
+	dryrunutil "k8s.io/kubernetes/cmd/kubeadm/app/util/dryrun"
 	"k8s.io/kubernetes/pkg/util/version"
 )
 
+var v190alpha3 = version.MustParseSemantic("v1.9.0-alpha.3")
+var expiry = 180 * 24 * time.Hour
+
 // PerformPostUpgradeTasks runs nearly the same functions as 'kubeadm init' would do
 // Note that the markmaster phase is left out, not needed, and no token is created as that doesn't belong to the upgrade
-func PerformPostUpgradeTasks(client clientset.Interface, cfg *kubeadmapi.MasterConfiguration, newK8sVer *version.Version) error {
+func PerformPostUpgradeTasks(client clientset.Interface, cfg *kubeadmapi.MasterConfiguration, newK8sVer *version.Version, dryRun bool) error {
 	errs := []error{}
 
 	// Upload currently used configuration to the cluster
@@ -58,8 +68,13 @@ func PerformPostUpgradeTasks(client clientset.Interface, cfg *kubeadmapi.MasterC
 		errs = append(errs, err)
 	}
 
-	// Create/update RBAC rules that makes the 1.8.0+ nodes to rotate certificates and get their CSRs approved automatically
+	// Create/update RBAC rules that makes the nodes to rotate certificates and get their CSRs approved automatically
 	if err := nodebootstraptoken.AutoApproveNodeCertificateRotation(client); err != nil {
+		errs = append(errs, err)
+	}
+
+	// Upgrade to a self-hosted control plane if possible
+	if err := upgradeToSelfHosting(client, cfg, newK8sVer, dryRun); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -74,7 +89,7 @@ func PerformPostUpgradeTasks(client clientset.Interface, cfg *kubeadmapi.MasterC
 	}
 
 	certAndKeyDir := kubeadmapiext.DefaultCertificatesDir
-	shouldBackup, err := shouldBackupAPIServerCertAndKey(certAndKeyDir, newK8sVer)
+	shouldBackup, err := shouldBackupAPIServerCertAndKey(certAndKeyDir)
 	// Don't fail the upgrade phase if failing to determine to backup kube-apiserver cert and key.
 	if err != nil {
 		fmt.Printf("[postupgrade] WARNING: failed to determine to backup kube-apiserver cert and key: %v", err)
@@ -92,9 +107,11 @@ func PerformPostUpgradeTasks(client clientset.Interface, cfg *kubeadmapi.MasterC
 	if err := dns.EnsureDNSAddon(cfg, client); err != nil {
 		errs = append(errs, err)
 	}
-
-	if err := coreDNSDeployment(cfg, client); err != nil {
-		errs = append(errs, err)
+	// Remove the old kube-dns deployment if coredns is now used
+	if !dryRun {
+		if err := removeOldKubeDNSDeploymentIfCoreDNSIsUsed(cfg, client); err != nil {
+			errs = append(errs, err)
+		}
 	}
 
 	if err := proxy.EnsureProxyAddon(cfg, client); err != nil {
@@ -103,22 +120,100 @@ func PerformPostUpgradeTasks(client clientset.Interface, cfg *kubeadmapi.MasterC
 	return errors.NewAggregate(errs)
 }
 
-func coreDNSDeployment(cfg *kubeadmapi.MasterConfiguration, client clientset.Interface) error {
+func removeOldKubeDNSDeploymentIfCoreDNSIsUsed(cfg *kubeadmapi.MasterConfiguration, client clientset.Interface) error {
 	if features.Enabled(cfg.FeatureGates, features.CoreDNS) {
 		return apiclient.TryRunCommand(func() error {
-			getCoreDNS, err := client.AppsV1beta2().Deployments(metav1.NamespaceSystem).Get(kubeadmconstants.CoreDNS, metav1.GetOptions{})
+			coreDNSDeployment, err := client.AppsV1().Deployments(metav1.NamespaceSystem).Get(kubeadmconstants.CoreDNS, metav1.GetOptions{})
 			if err != nil {
 				return err
 			}
-			if getCoreDNS.Status.ReadyReplicas == 0 {
-				return fmt.Errorf("the CodeDNS deployment isn't ready yet")
+			if coreDNSDeployment.Status.ReadyReplicas == 0 {
+				return fmt.Errorf("the CoreDNS deployment isn't ready yet")
 			}
-			err = client.AppsV1beta2().Deployments(metav1.NamespaceSystem).Delete(kubeadmconstants.KubeDNS, nil)
-			if err != nil {
+			err = apiclient.DeleteDeploymentForeground(client, metav1.NamespaceSystem, kubeadmconstants.KubeDNS)
+			if err != nil && !apierrors.IsNotFound(err) {
 				return err
 			}
 			return nil
-		}, 5)
+		}, 10)
 	}
 	return nil
+}
+
+func upgradeToSelfHosting(client clientset.Interface, cfg *kubeadmapi.MasterConfiguration, newK8sVer *version.Version, dryRun bool) error {
+	if features.Enabled(cfg.FeatureGates, features.SelfHosting) && !IsControlPlaneSelfHosted(client) && newK8sVer.AtLeast(v190alpha3) {
+
+		waiter := getWaiter(dryRun, client)
+
+		// kubeadm will now convert the static Pod-hosted control plane into a self-hosted one
+		fmt.Println("[self-hosted] Creating self-hosted control plane.")
+		if err := selfhosting.CreateSelfHostedControlPlane(kubeadmconstants.GetStaticPodDirectory(), kubeadmconstants.KubernetesDir, cfg, client, waiter, dryRun); err != nil {
+			return fmt.Errorf("error creating self hosted control plane: %v", err)
+		}
+	}
+	return nil
+}
+
+// getWaiter gets the right waiter implementation for the right occasion
+// TODO: Consolidate this with what's in init.go?
+func getWaiter(dryRun bool, client clientset.Interface) apiclient.Waiter {
+	if dryRun {
+		return dryrunutil.NewWaiter()
+	}
+	return apiclient.NewKubeWaiter(client, 30*time.Minute, os.Stdout)
+}
+
+// backupAPIServerCertAndKey backups the old cert and key of kube-apiserver to a specified directory.
+func backupAPIServerCertAndKey(certAndKeyDir string) error {
+	subDir := filepath.Join(certAndKeyDir, "expired")
+	if err := os.Mkdir(subDir, 0766); err != nil {
+		return fmt.Errorf("failed to created backup directory %s: %v", subDir, err)
+	}
+
+	filesToMove := map[string]string{
+		filepath.Join(certAndKeyDir, kubeadmconstants.APIServerCertName): filepath.Join(subDir, kubeadmconstants.APIServerCertName),
+		filepath.Join(certAndKeyDir, kubeadmconstants.APIServerKeyName):  filepath.Join(subDir, kubeadmconstants.APIServerKeyName),
+	}
+	return moveFiles(filesToMove)
+}
+
+// moveFiles moves files from one directory to another.
+func moveFiles(files map[string]string) error {
+	filesToRecover := map[string]string{}
+	for from, to := range files {
+		if err := os.Rename(from, to); err != nil {
+			return rollbackFiles(filesToRecover, err)
+		}
+		filesToRecover[to] = from
+	}
+	return nil
+}
+
+// rollbackFiles moves the files back to the original directory.
+func rollbackFiles(files map[string]string, originalErr error) error {
+	errs := []error{originalErr}
+	for from, to := range files {
+		if err := os.Rename(from, to); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return fmt.Errorf("couldn't move these files: %v. Got errors: %v", files, errors.NewAggregate(errs))
+}
+
+// shouldBackupAPIServerCertAndKey checks if the cert of kube-apiserver will be expired in 180 days.
+func shouldBackupAPIServerCertAndKey(certAndKeyDir string) (bool, error) {
+	apiServerCert := filepath.Join(certAndKeyDir, kubeadmconstants.APIServerCertName)
+	certs, err := certutil.CertsFromFile(apiServerCert)
+	if err != nil {
+		return false, fmt.Errorf("couldn't load the certificate file %s: %v", apiServerCert, err)
+	}
+	if len(certs) == 0 {
+		return false, fmt.Errorf("no certificate data found")
+	}
+
+	if time.Now().Sub(certs[0].NotBefore) > expiry {
+		return true, nil
+	}
+
+	return false, nil
 }

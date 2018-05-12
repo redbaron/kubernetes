@@ -103,7 +103,7 @@ func getSelfhostingSubCommand() *cobra.Command {
 
 			// Converts the Static Pod-hosted control plane into a self-hosted one
 			waiter := apiclient.NewKubeWaiter(client, 2*time.Minute, os.Stdout)
-			err = selfhosting.CreateSelfHostedControlPlane(constants.GetStaticPodDirectory(), constants.KubernetesDir, internalcfg, client, waiter)
+			err = selfhosting.CreateSelfHostedControlPlane(constants.GetStaticPodDirectory(), constants.KubernetesDir, internalcfg, client, waiter, false)
 			kubeadmutil.CheckErr(err)
 		},
 	}
@@ -111,7 +111,7 @@ func getSelfhostingSubCommand() *cobra.Command {
 	// Add flags to the command
 	// flags bound to the configuration object
 	cmd.Flags().StringVar(&cfg.CertificatesDir, "cert-dir", cfg.CertificatesDir, `The path where certificates are stored`)
-	cmd.Flags().StringVar(&cfgPath, "config", cfgPath, "Path to a kubeadm config file. WARNING: Usage of a configuration file is experimental!")
+	cmd.Flags().StringVar(&cfgPath, "config", cfgPath, "Path to a kubeadm config file. WARNING: Usage of a configuration file is experimental")
 	cmd.Flags().StringVar(&featureGatesString, "feature-gates", featureGatesString, "A set of key=value pairs that describe feature gates for various features. "+
 		"Options are:\n"+strings.Join(features.KnownFeatures(&features.InitFeatureGates), "\n"))
 

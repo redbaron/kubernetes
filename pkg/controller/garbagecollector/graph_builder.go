@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/kubernetes/pkg/controller/garbagecollector/metaonly"
 )
 
 type eventType int
@@ -82,16 +83,15 @@ type GraphBuilder struct {
 	// After that it is safe to start them here, before that it is not.
 	informersStarted <-chan struct{}
 
-	// stopCh drives shutdown. If it is nil, it indicates that Run() has not been
-	// called yet. If it is non-nil, then when closed it indicates everything
-	// should shut down.
-	//
+	// stopCh drives shutdown. When a receive from it unblocks, monitors will shut down.
 	// This channel is also protected by monitorLock.
 	stopCh <-chan struct{}
 
-	// metaOnlyClientPool uses a special codec, which removes fields except for
-	// apiVersion, kind, and metadata during decoding.
-	metaOnlyClientPool dynamic.ClientPool
+	// running tracks whether Run() has been called.
+	// it is protected by monitorLock.
+	running bool
+
+	dynamicClient dynamic.Interface
 	// monitors are the producer of the graphChanges queue, graphBuilder alters
 	// the in-memory graph according to the changes.
 	graphChanges workqueue.RateLimitingInterface
@@ -128,24 +128,12 @@ type monitors map[schema.GroupVersionResource]*monitor
 func listWatcher(client dynamic.Interface, resource schema.GroupVersionResource) *cache.ListWatch {
 	return &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			// APIResource.Kind is not used by the dynamic client, so
-			// leave it empty. We want to list this resource in all
-			// namespaces if it's namespace scoped, so leave
-			// APIResource.Namespaced as false is all right.
-			apiResource := metav1.APIResource{Name: resource.Resource}
-			return client.ParameterCodec(dynamic.VersionedParameterEncoderWithV1Fallback).
-				Resource(&apiResource, metav1.NamespaceAll).
-				List(options)
+			// We want to list this resource in all namespaces if it's namespace scoped, so not passing namespace is ok.
+			return client.Resource(resource).List(options)
 		},
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			// APIResource.Kind is not used by the dynamic client, so
-			// leave it empty. We want to list this resource in all
-			// namespaces if it's namespace scoped, so leave
-			// APIResource.Namespaced as false is all right.
-			apiResource := metav1.APIResource{Name: resource.Resource}
-			return client.ParameterCodec(dynamic.VersionedParameterEncoderWithV1Fallback).
-				Resource(&apiResource, metav1.NamespaceAll).
-				Watch(options)
+			// We want to list this resource in all namespaces if it's namespace scoped, so not passing namespace is ok.
+			return client.Resource(resource).Watch(options)
 		},
 	}
 }
@@ -197,12 +185,8 @@ func (gb *GraphBuilder) controllerFor(resource schema.GroupVersionResource, kind
 
 	// TODO: consider store in one storage.
 	glog.V(5).Infof("create storage for resource %s", resource)
-	client, err := gb.metaOnlyClientPool.ClientForGroupVersionKind(kind)
-	if err != nil {
-		return nil, err
-	}
 	_, monitor := cache.NewInformer(
-		listWatcher(client, resource),
+		listWatcher(gb.dynamicClient, resource),
 		nil,
 		ResourceResyncTime,
 		// don't need to clone because it's not from shared cache
@@ -274,7 +258,7 @@ func (gb *GraphBuilder) startMonitors() {
 	gb.monitorLock.Lock()
 	defer gb.monitorLock.Unlock()
 
-	if gb.stopCh == nil {
+	if !gb.running {
 		return
 	}
 
@@ -324,6 +308,7 @@ func (gb *GraphBuilder) Run(stopCh <-chan struct{}) {
 	// Set up the stop channel.
 	gb.monitorLock.Lock()
 	gb.stopCh = stopCh
+	gb.running = true
 	gb.monitorLock.Unlock()
 
 	// Start monitors and begin change processing until the stop channel is
@@ -369,8 +354,16 @@ func DefaultIgnoredResources() map[schema.GroupResource]struct{} {
 	return ignoredResources
 }
 
-func (gb *GraphBuilder) enqueueChanges(e *event) {
-	gb.graphChanges.Add(e)
+// enqueueVirtualDeleteEvent is used to add a virtual delete event to be processed for virtual nodes
+// once it is determined they do not have backing objects in storage
+func (gb *GraphBuilder) enqueueVirtualDeleteEvent(ref objectReference) {
+	gb.graphChanges.Add(&event{
+		eventType: deleteEvent,
+		obj: &metaonly.MetadataOnlyObject{
+			TypeMeta:   metav1.TypeMeta{APIVersion: ref.APIVersion, Kind: ref.Kind},
+			ObjectMeta: metav1.ObjectMeta{Namespace: ref.Namespace, UID: ref.UID, Name: ref.Name},
+		},
+	})
 }
 
 // addDependentToOwners adds n to owners' dependents list. If the owner does not
@@ -382,22 +375,26 @@ func (gb *GraphBuilder) addDependentToOwners(n *node, owners []metav1.OwnerRefer
 		ownerNode, ok := gb.uidToNode.Read(owner.UID)
 		if !ok {
 			// Create a "virtual" node in the graph for the owner if it doesn't
-			// exist in the graph yet. Then enqueue the virtual node into the
-			// attemptToDelete. The garbage processor will enqueue a virtual delete
-			// event to delete it from the graph if API server confirms this
-			// owner doesn't exist.
+			// exist in the graph yet.
 			ownerNode = &node{
 				identity: objectReference{
 					OwnerReference: owner,
 					Namespace:      n.identity.Namespace,
 				},
 				dependents: make(map[*node]struct{}),
+				virtual:    true,
 			}
 			glog.V(5).Infof("add virtual node.identity: %s\n\n", ownerNode.identity)
 			gb.uidToNode.Write(ownerNode)
-			gb.attemptToDelete.Add(ownerNode)
 		}
 		ownerNode.addDependent(n)
+		if !ok {
+			// Enqueue the virtual node into attemptToDelete.
+			// The garbage processor will enqueue a virtual delete
+			// event to delete it from the graph if API server confirms this
+			// owner doesn't exist.
+			gb.attemptToDelete.Add(ownerNode)
+		}
 	}
 }
 
@@ -588,6 +585,12 @@ func (gb *GraphBuilder) processGraphChanges() bool {
 	glog.V(5).Infof("GraphBuilder process object: %s/%s, namespace %s, name %s, uid %s, event type %v", event.gvk.GroupVersion().String(), event.gvk.Kind, accessor.GetNamespace(), accessor.GetName(), string(accessor.GetUID()), event.eventType)
 	// Check if the node already exsits
 	existingNode, found := gb.uidToNode.Read(accessor.GetUID())
+	if found {
+		// this marks the node as having been observed via an informer event
+		// 1. this depends on graphChanges only containing add/update events from the actual informer
+		// 2. this allows things tracking virtual nodes' existence to stop polling and rely on informer events
+		existingNode.markObserved()
+	}
 	switch {
 	case (event.eventType == addEvent || event.eventType == updateEvent) && !found:
 		newNode := &node{

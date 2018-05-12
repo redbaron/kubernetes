@@ -27,8 +27,9 @@ import (
 )
 
 var (
-	ReadWrite = []string{"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"}
-	Read      = []string{"get", "list", "watch"}
+	ReadWrite  = []string{"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"}
+	Read       = []string{"get", "list", "watch"}
+	ReadUpdate = []string{"get", "list", "watch", "update", "patch"}
 
 	Label      = map[string]string{"kubernetes.io/bootstrapping": "rbac-defaults"}
 	Annotation = map[string]string{rbac.AutoUpdateAnnotationKey: "true"}
@@ -48,6 +49,7 @@ const (
 	storageGroup        = "storage.k8s.io"
 	resMetricsGroup     = "metrics.k8s.io"
 	customMetricsGroup  = "custom.metrics.k8s.io"
+	networkingGroup     = "networking.k8s.io"
 )
 
 func addDefaultMetadata(obj runtime.Object) {
@@ -143,6 +145,19 @@ func NodeRules() []rbac.PolicyRule {
 		pvcStatusPolicyRule := rbac.NewRule("get", "update", "patch").Groups(legacyGroup).Resources("persistentvolumeclaims/status").RuleOrDie()
 		nodePolicyRules = append(nodePolicyRules, pvcStatusPolicyRule)
 	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.TokenRequest) {
+		// Use the Node authorization to limit a node to create tokens for service accounts running on that node
+		// Use the NodeRestriction admission plugin to limit a node to create tokens bound to pods on that node
+		tokenRequestRule := rbac.NewRule("create").Groups(legacyGroup).Resources("serviceaccounts/token").RuleOrDie()
+		nodePolicyRules = append(nodePolicyRules, tokenRequestRule)
+	}
+
+	// CSI
+	if utilfeature.DefaultFeatureGate.Enabled(features.CSIPersistentVolume) {
+		volAttachRule := rbac.NewRule("get").Groups(storageGroup).Resources("volumeattachments").RuleOrDie()
+		nodePolicyRules = append(nodePolicyRules, volAttachRule)
+	}
 	return nodePolicyRules
 }
 
@@ -162,12 +177,13 @@ func ClusterRoles() []rbac.ClusterRole {
 			ObjectMeta: metav1.ObjectMeta{Name: "system:discovery"},
 			Rules: []rbac.PolicyRule{
 				rbac.NewRule("get").URLs(
-					"/healthz", "/version",
+					"/healthz", "/version", "/version/",
 					// remove once swagger 1.2 support is removed
 					"/swaggerapi", "/swaggerapi/*",
 					// do not expand this pattern for openapi discovery docs
 					// move to a single openapi endpoint that takes accept/accept-encoding headers
 					"/swagger.json", "/swagger-2.0.0.pb-v1",
+					"/openapi", "/openapi/*",
 					"/api", "/api/*",
 					"/apis", "/apis/*",
 				).RuleOrDie(),
@@ -220,7 +236,8 @@ func ClusterRoles() []rbac.ClusterRole {
 				rbac.NewRule(Read...).Groups(legacyGroup).Resources("namespaces").RuleOrDie(),
 				rbac.NewRule("impersonate").Groups(legacyGroup).Resources("serviceaccounts").RuleOrDie(),
 
-				rbac.NewRule(ReadWrite...).Groups(appsGroup).Resources("statefulsets",
+				rbac.NewRule(ReadWrite...).Groups(appsGroup).Resources(
+					"statefulsets", "statefulsets/scale",
 					"daemonsets",
 					"deployments", "deployments/scale", "deployments/rollback",
 					"replicasets", "replicasets/scale").RuleOrDie(),
@@ -231,9 +248,12 @@ func ClusterRoles() []rbac.ClusterRole {
 
 				rbac.NewRule(ReadWrite...).Groups(extensionsGroup).Resources("daemonsets",
 					"deployments", "deployments/scale", "deployments/rollback", "ingresses",
-					"replicasets", "replicasets/scale", "replicationcontrollers/scale").RuleOrDie(),
+					"replicasets", "replicasets/scale", "replicationcontrollers/scale",
+					"networkpolicies").RuleOrDie(),
 
 				rbac.NewRule(ReadWrite...).Groups(policyGroup).Resources("poddisruptionbudgets").RuleOrDie(),
+
+				rbac.NewRule(ReadWrite...).Groups(networkingGroup).Resources("networkpolicies").RuleOrDie(),
 
 				// additional admin powers
 				rbac.NewRule("create").Groups(authorizationGroup).Resources("localsubjectaccessreviews").RuleOrDie(),
@@ -256,7 +276,8 @@ func ClusterRoles() []rbac.ClusterRole {
 				rbac.NewRule(Read...).Groups(legacyGroup).Resources("namespaces").RuleOrDie(),
 				rbac.NewRule("impersonate").Groups(legacyGroup).Resources("serviceaccounts").RuleOrDie(),
 
-				rbac.NewRule(ReadWrite...).Groups(appsGroup).Resources("statefulsets",
+				rbac.NewRule(ReadWrite...).Groups(appsGroup).Resources(
+					"statefulsets", "statefulsets/scale",
 					"daemonsets",
 					"deployments", "deployments/scale", "deployments/rollback",
 					"replicasets", "replicasets/scale").RuleOrDie(),
@@ -267,9 +288,12 @@ func ClusterRoles() []rbac.ClusterRole {
 
 				rbac.NewRule(ReadWrite...).Groups(extensionsGroup).Resources("daemonsets",
 					"deployments", "deployments/scale", "deployments/rollback", "ingresses",
-					"replicasets", "replicasets/scale", "replicationcontrollers/scale").RuleOrDie(),
+					"replicasets", "replicasets/scale", "replicationcontrollers/scale",
+					"networkpolicies").RuleOrDie(),
 
 				rbac.NewRule(ReadWrite...).Groups(policyGroup).Resources("poddisruptionbudgets").RuleOrDie(),
+
+				rbac.NewRule(ReadWrite...).Groups(networkingGroup).Resources("networkpolicies").RuleOrDie(),
 			},
 		},
 		{
@@ -285,7 +309,8 @@ func ClusterRoles() []rbac.ClusterRole {
 				// indicator of which namespaces you have access to.
 				rbac.NewRule(Read...).Groups(legacyGroup).Resources("namespaces").RuleOrDie(),
 
-				rbac.NewRule(Read...).Groups(appsGroup).Resources("statefulsets",
+				rbac.NewRule(Read...).Groups(appsGroup).Resources(
+					"statefulsets", "statefulsets/scale",
 					"daemonsets",
 					"deployments", "deployments/scale",
 					"replicasets", "replicasets/scale").RuleOrDie(),
@@ -295,9 +320,12 @@ func ClusterRoles() []rbac.ClusterRole {
 				rbac.NewRule(Read...).Groups(batchGroup).Resources("jobs", "cronjobs").RuleOrDie(),
 
 				rbac.NewRule(Read...).Groups(extensionsGroup).Resources("daemonsets", "deployments", "deployments/scale",
-					"ingresses", "replicasets", "replicasets/scale", "replicationcontrollers/scale").RuleOrDie(),
+					"ingresses", "replicasets", "replicasets/scale", "replicationcontrollers/scale",
+					"networkpolicies").RuleOrDie(),
 
 				rbac.NewRule(Read...).Groups(policyGroup).Resources("poddisruptionbudgets").RuleOrDie(),
+
+				rbac.NewRule(Read...).Groups(networkingGroup).Resources("networkpolicies").RuleOrDie(),
 			},
 		},
 		{
@@ -332,6 +360,17 @@ func ClusterRoles() []rbac.ClusterRole {
 				rbac.NewRule("get").Groups(legacyGroup).Resources("nodes").RuleOrDie(),
 
 				eventsRule(),
+			},
+		},
+		{
+			// a role to use for full access to the kubelet API
+			ObjectMeta: metav1.ObjectMeta{Name: "system:kubelet-api-admin"},
+			Rules: []rbac.PolicyRule{
+				// Allow read-only access to the Node API objects
+				rbac.NewRule("get", "list", "watch").Groups(legacyGroup).Resources("nodes").RuleOrDie(),
+				// Allow all API calls to the nodes
+				rbac.NewRule("proxy").Groups(legacyGroup).Resources("nodes").RuleOrDie(),
+				rbac.NewRule("*").Groups(legacyGroup).Resources("nodes/proxy", "nodes/metrics", "nodes/spec", "nodes/stats", "nodes/log").RuleOrDie(),
 			},
 		},
 		{
@@ -423,6 +462,33 @@ func ClusterRoles() []rbac.ClusterRole {
 			},
 		},
 		{
+			// a role for the csi external provisioner
+			ObjectMeta: metav1.ObjectMeta{Name: "system:csi-external-provisioner"},
+			Rules: []rbac.PolicyRule{
+				rbac.NewRule("create", "delete", "list", "watch").Groups(legacyGroup).Resources("persistentvolumes").RuleOrDie(),
+				rbac.NewRule("get", "list", "watch", "update", "patch").Groups(legacyGroup).Resources("persistentvolumeclaims").RuleOrDie(),
+				rbac.NewRule("list", "watch").Groups(storageGroup).Resources("storageclasses").RuleOrDie(),
+				rbac.NewRule("get", "list", "watch", "create", "update", "patch").Groups(legacyGroup).Resources("events").RuleOrDie(),
+			},
+		},
+		{
+			// a role for the csi external attacher
+			ObjectMeta: metav1.ObjectMeta{Name: "system:csi-external-attacher"},
+			Rules: []rbac.PolicyRule{
+				rbac.NewRule("get", "list", "watch", "update", "patch").Groups(legacyGroup).Resources("persistentvolumes").RuleOrDie(),
+				rbac.NewRule("get", "list", "watch").Groups(legacyGroup).Resources("nodes").RuleOrDie(),
+				rbac.NewRule("get", "list", "watch", "update", "patch").Groups(storageGroup).Resources("volumeattachments").RuleOrDie(),
+				rbac.NewRule("get", "list", "watch", "create", "update", "patch").Groups(legacyGroup).Resources("events").RuleOrDie(),
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "system:aws-cloud-provider"},
+			Rules: []rbac.PolicyRule{
+				rbac.NewRule("get", "patch").Groups(legacyGroup).Resources("nodes").RuleOrDie(),
+				eventsRule(),
+			},
+		},
+		{
 			// a role making the csrapprover controller approve a node client CSR
 			ObjectMeta: metav1.ObjectMeta{Name: "system:certificates.k8s.io:certificatesigningrequests:nodeclient"},
 			Rules: []rbac.PolicyRule{
@@ -438,26 +504,14 @@ func ClusterRoles() []rbac.ClusterRole {
 		},
 	}
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.RotateKubeletServerCertificate) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.VolumeScheduling) {
 		roles = append(roles, rbac.ClusterRole{
-			// a role making the csrapprover controller approve a node server CSR requested by the node itself
-			ObjectMeta: metav1.ObjectMeta{Name: "system:certificates.k8s.io:certificatesigningrequests:selfnodeserver"},
+			ObjectMeta: metav1.ObjectMeta{Name: "system:volume-scheduler"},
 			Rules: []rbac.PolicyRule{
-				rbac.NewRule("create").Groups(certificatesGroup).Resources("certificatesigningrequests/selfnodeserver").RuleOrDie(),
+				rbac.NewRule(ReadUpdate...).Groups(legacyGroup).Resources("persistentvolumes").RuleOrDie(),
+				rbac.NewRule(Read...).Groups(storageGroup).Resources("storageclasses").RuleOrDie(),
 			},
 		})
-	}
-
-	if utilfeature.DefaultFeatureGate.Enabled(features.VolumeScheduling) {
-		// Find the scheduler role
-		for i, role := range roles {
-			if role.Name == "system:kube-scheduler" {
-				pvRule := rbac.NewRule("update").Groups(legacyGroup).Resources("persistentvolumes").RuleOrDie()
-				scRule := rbac.NewRule(Read...).Groups(storageGroup).Resources("storageclasses").RuleOrDie()
-				roles[i].Rules = append(role.Rules, pvRule, scRule)
-				break
-			}
-		}
 	}
 
 	addClusterRoleLabel(roles)
@@ -476,6 +530,7 @@ func ClusterRoleBindings() []rbac.ClusterRoleBinding {
 		rbac.NewClusterBinding("system:kube-controller-manager").Users(user.KubeControllerManager).BindingOrDie(),
 		rbac.NewClusterBinding("system:kube-dns").SAs("kube-system", "kube-dns").BindingOrDie(),
 		rbac.NewClusterBinding("system:kube-scheduler").Users(user.KubeScheduler).BindingOrDie(),
+		rbac.NewClusterBinding("system:aws-cloud-provider").SAs("kube-system", "aws-cloud-provider").BindingOrDie(),
 
 		// This default binding of the system:node role to the system:nodes group is deprecated in 1.7 with the availability of the Node authorizer.
 		// This leaves the binding, but with an empty set of subjects, so that tightening reconciliation can remove the subject.
@@ -483,6 +538,10 @@ func ClusterRoleBindings() []rbac.ClusterRoleBinding {
 			ObjectMeta: metav1.ObjectMeta{Name: systemNodeRoleName},
 			RoleRef:    rbac.RoleRef{APIGroup: rbac.GroupName, Kind: "ClusterRole", Name: systemNodeRoleName},
 		},
+	}
+
+	if utilfeature.DefaultFeatureGate.Enabled(features.VolumeScheduling) {
+		rolebindings = append(rolebindings, rbac.NewClusterBinding("system:volume-scheduler").Users(user.KubeScheduler).BindingOrDie())
 	}
 
 	addClusterRoleBindingLabel(rolebindings)

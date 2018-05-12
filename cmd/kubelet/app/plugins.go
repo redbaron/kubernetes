@@ -24,9 +24,9 @@ import (
 	_ "k8s.io/kubernetes/pkg/credentialprovider/gcp"
 	_ "k8s.io/kubernetes/pkg/credentialprovider/rancher"
 	// Network plugins
-	"k8s.io/kubernetes/pkg/kubelet/network"
-	"k8s.io/kubernetes/pkg/kubelet/network/cni"
-	"k8s.io/kubernetes/pkg/kubelet/network/kubenet"
+	"k8s.io/kubernetes/pkg/kubelet/dockershim/network"
+	"k8s.io/kubernetes/pkg/kubelet/dockershim/network/cni"
+	"k8s.io/kubernetes/pkg/kubelet/dockershim/network/kubenet"
 	// Volume plugins
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/aws_ebs"
@@ -100,7 +100,7 @@ func ProbeVolumePlugins() []volume.VolumePlugin {
 	allPlugins = append(allPlugins, scaleio.ProbeVolumePlugins()...)
 	allPlugins = append(allPlugins, local.ProbeVolumePlugins()...)
 	allPlugins = append(allPlugins, storageos.ProbeVolumePlugins()...)
-	if !utilfeature.DefaultFeatureGate.Enabled(features.CSIPersistentVolume) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.CSIPersistentVolume) {
 		allPlugins = append(allPlugins, csi.ProbeVolumePlugins()...)
 	}
 	return allPlugins
@@ -114,12 +114,12 @@ func GetDynamicPluginProber(pluginDir string) volume.DynamicPluginProber {
 }
 
 // ProbeNetworkPlugins collects all compiled-in plugins
-func ProbeNetworkPlugins(cniConfDir, cniBinDir string) []network.NetworkPlugin {
+func ProbeNetworkPlugins(cniConfDir string, cniBinDirs []string) []network.NetworkPlugin {
 	allPlugins := []network.NetworkPlugin{}
 
 	// for each existing plugin, add to the list
-	allPlugins = append(allPlugins, cni.ProbeNetworkPlugins(cniConfDir, cniBinDir)...)
-	allPlugins = append(allPlugins, kubenet.NewPlugin(cniBinDir))
+	allPlugins = append(allPlugins, cni.ProbeNetworkPlugins(cniConfDir, cniBinDirs)...)
+	allPlugins = append(allPlugins, kubenet.NewPlugin(cniBinDirs))
 
 	return allPlugins
 }

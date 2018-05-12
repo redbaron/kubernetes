@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 	utiltesting "k8s.io/client-go/util/testing"
 	"k8s.io/kubernetes/pkg/cloudprovider"
 	"k8s.io/kubernetes/pkg/util/io"
@@ -40,7 +41,8 @@ import (
 	utilstrings "k8s.io/kubernetes/pkg/util/strings"
 	. "k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util"
-	"k8s.io/kubernetes/pkg/volume/util/volumehelper"
+	"k8s.io/kubernetes/pkg/volume/util/recyclerclient"
+	"k8s.io/kubernetes/pkg/volume/util/volumepathhandler"
 )
 
 // fakeVolumeHost is useful for testing volume plugins.
@@ -53,6 +55,7 @@ type fakeVolumeHost struct {
 	exec       mount.Exec
 	writer     io.Writer
 	nodeLabels map[string]string
+	nodeName   string
 }
 
 func NewFakeVolumeHost(rootDir string, kubeClient clientset.Interface, plugins []VolumePlugin) *fakeVolumeHost {
@@ -69,6 +72,12 @@ func NewFakeVolumeHostWithNodeLabels(rootDir string, kubeClient clientset.Interf
 	return volHost
 }
 
+func NewFakeVolumeHostWithNodeName(rootDir string, kubeClient clientset.Interface, plugins []VolumePlugin, nodeName string) *fakeVolumeHost {
+	volHost := newFakeVolumeHost(rootDir, kubeClient, plugins, nil)
+	volHost.nodeName = nodeName
+	return volHost
+}
+
 func newFakeVolumeHost(rootDir string, kubeClient clientset.Interface, plugins []VolumePlugin, cloud cloudprovider.Interface) *fakeVolumeHost {
 	host := &fakeVolumeHost{rootDir: rootDir, kubeClient: kubeClient, cloud: cloud}
 	host.mounter = &mount.FakeMounter{}
@@ -82,8 +91,12 @@ func (f *fakeVolumeHost) GetPluginDir(podUID string) string {
 	return path.Join(f.rootDir, "plugins", podUID)
 }
 
-func (f *fakeVolumeHost) GetVolumeDevicePluginDir(podUID string) string {
-	return path.Join(f.rootDir, "plugins", podUID)
+func (f *fakeVolumeHost) GetVolumeDevicePluginDir(pluginName string) string {
+	return path.Join(f.rootDir, "plugins", pluginName, "volumeDevices")
+}
+
+func (f *fakeVolumeHost) GetPodsDir() string {
+	return path.Join(f.rootDir, "pods")
 }
 
 func (f *fakeVolumeHost) GetPodVolumeDir(podUID types.UID, pluginName, volumeName string) string {
@@ -177,6 +190,14 @@ func (f *fakeVolumeHost) GetNodeLabels() (map[string]string, error) {
 	return f.nodeLabels, nil
 }
 
+func (f *fakeVolumeHost) GetNodeName() types.NodeName {
+	return types.NodeName(f.nodeName)
+}
+
+func (f *fakeVolumeHost) GetEventRecorder() record.EventRecorder {
+	return nil
+}
+
 func ProbeVolumePlugins(config VolumeConfig) []VolumePlugin {
 	if _, ok := config.OtherAttributes["fake-property"]; ok {
 		return []VolumePlugin{
@@ -238,7 +259,17 @@ func (plugin *FakeVolumePlugin) GetPluginName() string {
 }
 
 func (plugin *FakeVolumePlugin) GetVolumeName(spec *Spec) (string, error) {
-	return spec.Name(), nil
+	var volumeName string
+	if spec.Volume != nil && spec.Volume.GCEPersistentDisk != nil {
+		volumeName = spec.Volume.GCEPersistentDisk.PDName
+	} else if spec.PersistentVolume != nil &&
+		spec.PersistentVolume.Spec.GCEPersistentDisk != nil {
+		volumeName = spec.PersistentVolume.Spec.GCEPersistentDisk.PDName
+	}
+	if volumeName == "" {
+		volumeName = spec.Name()
+	}
+	return volumeName, nil
 }
 
 func (plugin *FakeVolumePlugin) CanSupport(spec *Spec) bool {
@@ -368,7 +399,7 @@ func (plugin *FakeVolumePlugin) GetNewDetacherCallCount() int {
 	return plugin.NewDetacherCallCount
 }
 
-func (plugin *FakeVolumePlugin) Recycle(pvName string, spec *Spec, eventRecorder RecycleEventRecorder) error {
+func (plugin *FakeVolumePlugin) Recycle(pvName string, spec *Spec, eventRecorder recyclerclient.RecycleEventRecorder) error {
 	return nil
 }
 
@@ -700,7 +731,7 @@ func (fc *FakeProvisioner) Provision() (*v1.PersistentVolume, error) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fc.Options.PVName,
 			Annotations: map[string]string{
-				volumehelper.VolumeDynamicallyCreatedByKey: "fakeplugin-provisioner",
+				util.VolumeDynamicallyCreatedByKey: "fakeplugin-provisioner",
 			},
 		},
 		Spec: v1.PersistentVolumeSpec{
@@ -720,10 +751,10 @@ func (fc *FakeProvisioner) Provision() (*v1.PersistentVolume, error) {
 	return pv, nil
 }
 
-var _ util.BlockVolumePathHandler = &FakeVolumePathHandler{}
+var _ volumepathhandler.BlockVolumePathHandler = &FakeVolumePathHandler{}
 
 //NewDeviceHandler Create a new IoHandler implementation
-func NewBlockVolumePathHandler() util.BlockVolumePathHandler {
+func NewBlockVolumePathHandler() volumepathhandler.BlockVolumePathHandler {
 	return &FakeVolumePathHandler{}
 }
 
