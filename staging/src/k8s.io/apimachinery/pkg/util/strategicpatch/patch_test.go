@@ -2688,7 +2688,6 @@ mergingList:
 `),
 		},
 	},
-
 	{
 		Description: "add field to map in merging list nested in merging list with deletion conflict",
 		StrategicMergePatchRawTestCaseData: StrategicMergePatchRawTestCaseData{
@@ -3394,6 +3393,65 @@ mergingList:
     value: x
   - name: 1
     other: a
+`),
+		},
+	},
+	{
+		Description: "change an item in a list and preserve order of duplicates",
+		StrategicMergePatchRawTestCaseData: StrategicMergePatchRawTestCaseData{
+			Original: []byte(`
+mergingList:
+ - name: D1
+   value: URL1
+ - name: A
+   value: x
+ - name: D1
+   value: URL2
+`),
+			TwoWay: []byte(`
+$setElementOrder/mergingList:
+ - name: D1
+ - name: A
+ - name: D1
+mergingList:
+ - name: A
+   value: z
+`),
+			Modified: []byte(`
+mergingList:
+ - name: D1
+   value: URL1
+ - name: A
+   value: z
+ - name: D1
+   value: URL2
+`),
+			Current: []byte(`
+mergingList:
+ - name: D1
+   value: URL1
+ - name: A
+   value: x
+ - name: D1
+   value: URL2
+`),
+			ThreeWay: []byte(`
+$setElementOrder/mergingList:
+ - name: D1
+ - name: A
+ - name: D1
+mergingList:
+ - name: A
+   value: z
+`),
+			Result: []byte(`
+mergingList: 
+ - name: D1
+   value: URL1
+ - name: A
+   value: z
+ - name: D1
+   value: URL2
 `),
 		},
 	},
